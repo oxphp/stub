@@ -1,0 +1,45 @@
+{
+    "name": "oxphp/stubs",
+    "description": "OxPHP extension stubs for IDE autocompletion and static analysis (PHPStan, Psalm).",
+    "license": "MIT",
+    "type": "library",
+    "keywords": [
+        "oxphp",
+        "stubs",
+        "ide",
+        "autocomplete",
+        "phpstan",
+        "psalm",
+        "static-analysis",
+        "php-extension"
+    ],
+    "homepage": "https://github.com/oxphp/oxphp",
+    "support": {
+        "issues": "https://github.com/oxphp/oxphp/issues",
+        "source": "https://github.com/oxphp/stubs"
+    },
+    "authors": [
+        {
+            "name": "OxPHP Contributors",
+            "homepage": "https://github.com/oxphp/oxphp"
+        }
+    ],
+    "require": {
+        "php": ">=8.4"
+    },
+    "suggest": {
+        "phpstan/extension-installer": "Auto-registers the stubs with PHPStan via extension.neon",
+        "phpstan/phpstan": "Static analyzer that uses these stubs to type-check oxphp_* functions",
+        "vimeo/psalm": "Static analyzer that can load these stubs via <stubs> in psalm.xml"
+    },
+    "extra": {
+        "phpstan": {
+            "includes": [
+                "extension.neon"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

@@ -1,0 +1,6 @@
+# Auto-loaded by phpstan/extension-installer.
+# Tells PHPStan to read the OxPHP extension stubs so calls to
+# oxphp_*() functions are type-checked instead of reported as unknown.
+parameters:
+    scanFiles:
+        - oxphp.stub.php
