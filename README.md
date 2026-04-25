@@ -93,14 +93,63 @@ read the file directly without executing it, so they don't hit that problem.
 |----------|---------|
 | `oxphp_register_decorator(string)` | Register an `#[Attribute]` class as a decorator |
 
+### APM (OpenTelemetry tracing)
+
+| Function | Purpose |
+|----------|---------|
+| `oxphp_apm_trace(string, callable, array)` | Run callback inside an auto-closed child span |
+| `oxphp_apm_start(string, array)` | Open a manual child span (pair with `oxphp_apm_end()`) |
+| `oxphp_apm_end(int)` | Close a manually opened span |
+| `oxphp_apm_attribute(string, mixed, ?int)` | Add an attribute to the current (or given) span |
+| `oxphp_apm_event(string, array, ?int)` | Add a named timestamp event to a span |
+| `oxphp_apm_error(Throwable, ?int)` | Record an exception event and mark the span as error |
+| `oxphp_apm_status(int, ?string, ?int)` | Set explicit span status (`OXPHP_APM_OK` / `OXPHP_APM_ERROR`) |
+| `oxphp_apm_trace_id()` | Current 32-hex W3C trace ID |
+| `oxphp_apm_span_id()` | Current 16-hex active span ID |
+| `oxphp_apm_header()` | Build a W3C `traceparent` header value for outbound HTTP |
+
+Constants: `OXPHP_APM_OK`, `OXPHP_APM_ERROR`. Plus the `#[OxPHP\Apm\Trace]` attribute, auto-registered when APM is enabled, that wraps the annotated function/method in a span.
+
+### Profiler (`OxPHP\Profile`)
+
+| Function | Purpose |
+|----------|---------|
+| `OxPHP\Profile\is_active()` | Whether profiling is actively capturing spans |
+| `OxPHP\Profile\start()` | Enable profiling for the rest of the current request |
+| `OxPHP\Profile\stop()` | Stop further span capture |
+| `OxPHP\Profile\pause()` / `resume()` | Soft pause / resume around hot sections |
+| `OxPHP\Profile\mark(string, array)` | Attach a named marker event to the topmost open span |
+| `OxPHP\Profile\metric(string, float)` | Append a numeric `metric.<name>` attribute to the current span |
+
+Profiler attributes: `#[Profile]`, `#[Exclude]`, `#[Sample(rate)]`, `#[Tag(key, value)]` (repeatable), `#[Mark(label?)]`, `#[SlowThreshold(ms)]`, `#[MemoryThreshold(kb)]`.
+
+### Shared primitives (`OxPHP\Shared`)
+
+Process-wide concurrent primitives visible from every PHP worker thread.
+
+| Class | Purpose |
+|----------|---------|
+| `Counter` | Lock-free atomic signed 64-bit counter |
+| `Flag` | Atomic boolean flag |
+| `Once` | Run-once container with cross-worker initialisation |
+| `Mutex` | Poisoning mutex with optional timeout |
+| `Channel` | Bounded MPMC queue with fiber-aware blocking send / recv |
+| `Map` | Concurrent `string → mixed` key-value store with cycle detection |
+| `Pool` | Bounded object pool with idle-timeout eviction |
+
+Exception hierarchy under `OxPHP\Shared\`: `Exception` ← `StaleHandleException`, `TypeException` ← `CycleException`, `CapacityException`, `ClosedException`, `PoisonedException`, `TimeoutException` ← `DeadlockException`, `UninitializedException`. All Shared types implement the `OxPHP\Shared\Shareable` marker interface so they can be nested inside `Map` / `Channel` without serialisation.
+
 ### Object API
 
 The stub also declares the namespaced surface that the extension exposes at runtime:
 
 - `OxPHP\Http\{RequestInterface, SessionInterface, UploadedFileInterface, AttributesInterface}` and their final implementations (`Request`, `Session`, `UploadedFile`, `Attributes`).
 - `OxPHP\Http\Exception\{NoActiveRequestException, AsyncContextException, WorkerIdleException}` — thrown by `oxphp_http_request()` outside a live request context.
-- `OxPHP\{AsyncException, AsyncTimeoutException, AsyncBorrowException}` — thrown by the `oxphp_async_*()` family.
+- `OxPHP\Async\{Exception, TimeoutException, BorrowException, BorrowedProxy}` — thrown by the `oxphp_async_*()` family. `BorrowedProxy` is the opaque stand-in injected when a `use`-captured value is still borrowed by the source thread; every access throws `BorrowException`.
 - `OxPHP\Decorator\{AttributeInterface, Context, RejectedException}` — implement `AttributeInterface` and register with `oxphp_register_decorator()` to intercept calls.
+- `OxPHP\Apm\Trace` — automatic span attribute (auto-registered when APM is enabled).
+- `OxPHP\Profile\*` — profiler functions and attributes (see above).
+- `OxPHP\Shared\*` — process-wide concurrent primitives (see above).
 
 See [`oxphp.stub.php`](oxphp.stub.php) for full PHPDoc with parameter types,
 return types, and usage examples.
