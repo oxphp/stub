@@ -9,7 +9,7 @@
  * (PhpStorm, VS Code + Intelephense) and static analyzers (PHPStan, Psalm).
  *
  * @package OxPHP
- * @version 0.1.0
+ * @version 0.2.0
  * @link https://github.com/oxphp/oxphp
  */
 
@@ -91,7 +91,7 @@ function oxphp_worker_id(): int {}
  *
  * @example
  * $info = oxphp_server_info();
- * // ["sapi" => "oxphp", "version" => "0.1.0", "worker_id" => 3, "request_time" => 1740000000.123]
+ * // ["sapi" => "oxphp", "version" => "0.2.0", "worker_id" => 3, "request_time" => 1740000000.123]
  */
 function oxphp_server_info(): array {}
 
