@@ -139,6 +139,24 @@ Process-wide concurrent primitives visible from every PHP worker thread.
 
 Exception hierarchy under `OxPHP\Shared\`: `Exception` ← `StaleHandleException`, `TypeException` ← `CycleException`, `CapacityException`, `ClosedException`, `PoisonedException`, `TimeoutException` ← `DeadlockException`, `UninitializedException`. All Shared types implement the `OxPHP\Shared\Shareable` marker interface so they can be nested inside `Map` / `Channel` without serialisation.
 
+### Server runtime (`OxPHP\Server`)
+
+Per-thread handle for the OxPHP worker runtime, returned by `Worker::current()`.
+
+| Method | Purpose |
+|----------|---------|
+| `Worker::current()` | Per-thread `Worker` singleton |
+| `Worker::isWorkerMode()` | Whether this thread runs in worker mode |
+| `getId()` | Worker thread index (`0..N-1`) |
+| `getStartTime()` | Float Unix timestamp when the thread was spawned |
+| `getRequestCount()` | Requests this thread has started (1-based) |
+| `getMemoryUsage()` | Current Zend allocator usage in bytes |
+| `getRss()` | Process RSS in bytes |
+| `getMaxMemoryBytes()` | Configured worker memory cap in bytes (0 = none) |
+| `serve(callable)` | Enter the worker request-dispatch loop |
+
+`Worker::serve()` throws `OxPHP\Server\Exception\InvalidServeContextException` when called outside worker mode.
+
 ### Object API
 
 The stub also declares the namespaced surface that the extension exposes at runtime:
@@ -150,6 +168,7 @@ The stub also declares the namespaced surface that the extension exposes at runt
 - `OxPHP\Apm\Trace` — automatic span attribute (auto-registered when APM is enabled).
 - `OxPHP\Profile\*` — profiler functions and attributes (see above).
 - `OxPHP\Shared\*` — process-wide concurrent primitives (see above).
+- `OxPHP\Server\Worker` and `OxPHP\Server\Exception\InvalidServeContextException` — per-thread worker runtime handle (see above).
 
 See [`oxphp.stub.php`](oxphp.stub.php) for full PHPDoc with parameter types,
 return types, and usage examples.
