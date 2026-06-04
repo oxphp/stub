@@ -63,13 +63,16 @@ read the file directly without executing it, so they don't hit that problem.
 | `oxphp_superglobals_enabled()` | Whether `$_GET` / `$_POST` / etc. are populated |
 | `oxphp_request_id()` | Unique 16-hex-char request ID (mirrors `X-Request-ID`) |
 | `oxphp_worker_id()` | Zero-based PHP ZTS worker index |
-| `oxphp_server_info()` | SAPI name, version, worker id, request time |
+| `oxphp_server_info()` | Version, worker id, request time, worker-mode flag |
 | `oxphp_finish_request()` | Flush response, continue work in background |
 | `oxphp_is_worker()` | True when running under `oxphp_worker()` |
 | `oxphp_is_streaming()` | True for SSE / chunked-transfer requests |
-| `oxphp_request_heartbeat()` | Extend the request timeout from inside long loops |
 | `oxphp_stream_flush()` | Activate streaming mode and flush a chunk |
 | `oxphp_worker(callable)` | Enter the worker-mode request loop |
+
+> **Migration (v0.6.0):** `oxphp_request_heartbeat($time)` was removed. Replace each
+> call with `set_time_limit($seconds)` — both reset the per-request execution timer to
+> N seconds from now.
 
 ### Cooperative scheduling
 
@@ -85,7 +88,8 @@ read the file directly without executing it, so they don't hit that problem.
 | `oxphp_async(Closure, ...$args)` | Dispatch a closure to the async worker pool |
 | `oxphp_async_await(int, ?float)` | Block until a single promise resolves |
 | `oxphp_async_await_all(int[], ?float)` | Wait for every promise, return all results |
-| `oxphp_async_await_any(int[], ?float)` | Race promises, return the first to complete |
+| `oxphp_async_await_race(int[], ?float)` | First promise to settle wins (fulfil **or** reject) — `Promise.race` |
+| `oxphp_async_await_any(int[], ?float)` | First promise to **fulfil** wins; all-reject throws `AggregateAsyncException` — `Promise.any` |
 
 ### Decorators
 
@@ -129,15 +133,25 @@ Process-wide concurrent primitives visible from every PHP worker thread.
 
 | Class | Purpose |
 |----------|---------|
-| `Counter` | Lock-free atomic signed 64-bit counter |
-| `Flag` | Atomic boolean flag |
-| `Once` | Run-once container with cross-worker initialisation |
-| `Mutex` | Poisoning mutex with optional timeout |
-| `Channel` | Bounded MPMC queue with fiber-aware blocking send / recv |
-| `Map` | Concurrent `string → mixed` key-value store with cycle detection |
-| `Pool` | Bounded object pool with idle-timeout eviction |
+| `Counter` | Lock-free `Relaxed` atomic signed 64-bit counter |
+| `Atomic` | Generic atomic signed 64-bit integer with explicit `Ordering` (load/store/swap/CAS/fetch arithmetic & bitwise) |
+| `Flag` | Atomic boolean with explicit `Ordering` (load/store/swap/CAS) |
+| `Once` | Run-once container with cross-worker init; `Reset` / `Poison` failure modes |
+| `Mutex` | Cross-thread mutex — `withLock()` / `tryWithLock()` / `withLockTimeout()` |
+| `Channel` | Bounded MPMC `Countable` queue; result-typed `recv*` / `send*` (no hot-path exceptions) |
+| `Map` | Concurrent `int\|string → mixed` key-value store with CAS and cycle detection |
+| `Pool` | Bounded object pool — `acquire()` / `tryAcquire()` / `acquireTimeout()`, RAII `Handle`, `Stats` |
+| `Registry` | Name-keyed process-global get-or-create for every `Shared\*` type |
 
-Exception hierarchy under `OxPHP\Shared\`: `Exception` ← `StaleHandleException`, `TypeException` ← `CycleException`, `CapacityException`, `ClosedException`, `PoisonedException`, `TimeoutException` ← `DeadlockException`, `UninitializedException`. All Shared types implement the `OxPHP\Shared\Shareable` marker interface so they can be nested inside `Map` / `Channel` without serialisation.
+`Ordering` is a backing-`int` enum (`Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst`) consumed by `Atomic` / `Flag`; every method defaults to `SeqCst`.
+
+The bounded-wait convention across `Shared\*`: a bare method (`acquire`, `withLock`, `recv`) waits forever, a `try*` method is non-blocking, and a `*Timeout(int $ms)` method waits a bounded number of milliseconds (`$ms` must be `> 0`).
+
+Exception hierarchy under `OxPHP\Shared\`: `SharedException` ← `StaleHandleException`, `TypeException` ← `CycleException`, plus `CapacityException`, `ValueTooLargeException`, `ClosedException`, `PoisonedException` (deprecated), `UninitializedException`, `InvalidOrderingException`, `CorruptedMutexException`. Bounded-wait failures extend `OxPHP\Async\AsyncException` instead — `OperationTimeoutException`, `ContentionException`, `DeadlockException` — so one `catch (AsyncException)` sweeps both Shared and Async timeouts.
+
+Supporting sub-namespaces: `Shared\Once\{Status, FailureMode}` enums; `Shared\Map\KeyCursor` (lazy `getMany()` iterator); `Shared\Channel\{RecvStatus, SendStatus, RecvResult, SendResult}`; `Shared\Pool\{Handle, Stats}`.
+
+All Shared types implement the `OxPHP\Shared\Shareable` marker interface so they can be nested inside `Map` / `Channel` without serialisation.
 
 ### Server runtime (`OxPHP\Server`)
 
@@ -146,13 +160,16 @@ Per-thread handle for the OxPHP worker runtime, returned by `Worker::current()`.
 | Method | Purpose |
 |----------|---------|
 | `Worker::current()` | Per-thread `Worker` singleton |
-| `Worker::isWorkerMode()` | Whether this thread runs in worker mode |
-| `getId()` | Worker thread index (`0..N-1`) |
-| `getStartTime()` | Float Unix timestamp when the thread was spawned |
-| `getRequestCount()` | Requests this thread has started (1-based) |
-| `getMemoryUsage()` | Current Zend allocator usage in bytes |
-| `getRss()` | Process RSS in bytes |
-| `getMaxMemoryBytes()` | Configured worker memory cap in bytes (0 = none) |
+| `Worker::isWorkerMode()` | Whether this thread runs in worker mode (mirrors `oxphp_is_worker()`) |
+| `id()` | Worker thread index (`0..N-1`) |
+| `startTime()` | Float Unix timestamp when the thread was spawned |
+| `requestCount()` | Requests this thread has started (1-based) |
+| `memoryUsage()` | Current Zend allocator usage in bytes |
+| `rss()` | Process RSS in bytes |
+| `maxMemoryBytes()` | Configured worker memory cap in bytes (0 = none) |
+| `scheduleExit()` | Mark this worker for graceful exit after the current request |
+| `isExitScheduled()` | Whether a graceful exit is pending for this worker |
+| `exitReason()` | Pending-exit reason (`scheduled` / `max_memory` / `error`) or `null` |
 | `serve(callable)` | Enter the worker request-dispatch loop |
 
 `Worker::serve()` throws `OxPHP\Server\Exception\InvalidServeContextException` when called outside worker mode.
@@ -163,7 +180,7 @@ The stub also declares the namespaced surface that the extension exposes at runt
 
 - `OxPHP\Http\{RequestInterface, SessionInterface, UploadedFileInterface, AttributesInterface}` and their final implementations (`Request`, `Session`, `UploadedFile`, `Attributes`).
 - `OxPHP\Http\Exception\{NoActiveRequestException, AsyncContextException, WorkerIdleException}` — thrown by `oxphp_http_request()` outside a live request context.
-- `OxPHP\Async\{Exception, TimeoutException, BorrowException, BorrowedProxy}` — thrown by the `oxphp_async_*()` family. `BorrowedProxy` is the opaque stand-in injected when a `use`-captured value is still borrowed by the source thread; every access throws `BorrowException`.
+- `OxPHP\Async\{AsyncException, TimeoutException, AggregateAsyncException, BorrowException, BorrowedProxy}` — thrown by the `oxphp_async_*()` family. `TimeoutException` exposes `getPartialErrors()` / `getCancelledPromiseIds()` (populated by `oxphp_async_await_any()`); `AggregateAsyncException` carries every rejection when all promises fail. `BorrowedProxy` is the opaque stand-in injected when a `use`-captured value is still borrowed by the source thread; every access throws `BorrowException`.
 - `OxPHP\Decorator\{AttributeInterface, Context, RejectedException}` — implement `AttributeInterface` and register with `oxphp_register_decorator()` to intercept calls.
 - `OxPHP\Apm\Trace` — automatic span attribute (auto-registered when APM is enabled).
 - `OxPHP\Profile\*` — profiler functions and attributes (see above).

@@ -8,8 +8,12 @@
  * This file is NOT loaded at runtime — it is only used by IDEs
  * (PhpStorm, VS Code + Intelephense) and static analyzers (PHPStan, Psalm).
  *
+ * Migration: oxphp_request_heartbeat($time) was removed.
+ * Replace each call with set_time_limit($seconds). Both reset the
+ * per-request execution timer to N seconds from now.
+ *
  * @package OxPHP
- * @version 0.5.0
+ * @version 0.6.0
  * @link https://github.com/oxphp/oxphp
  */
 
@@ -87,11 +91,11 @@ function oxphp_worker_id(): int {}
  * The request_time is a Unix timestamp with microsecond precision,
  * set before php_request_startup() for accurate timing.
  *
- * @return array{sapi: string, version: string, worker_id: int, request_time: float}
+ * @return array{version: string, worker_id: int, request_time: float, worker_mode: bool}
  *
  * @example
  * $info = oxphp_server_info();
- * // ["sapi" => "oxphp", "version" => "0.1.0", "worker_id" => 3, "request_time" => 1740000000.123]
+ * // ["version" => "0.1.0", "worker_id" => 3, "request_time" => 1740000000.123, "worker_mode" => false]
  */
 function oxphp_server_info(): array {}
 
@@ -126,6 +130,9 @@ function oxphp_finish_request(): bool {}
  * if (oxphp_is_worker()) {
  *     // persistent connections, shared state, etc.
  * }
+ *
+ * @see \OxPHP\Server\Worker::isWorkerMode() Object-oriented equivalent; both
+ *      return the same value (delegate to the same underlying check).
  */
 function oxphp_is_worker(): bool {}
 
@@ -144,24 +151,6 @@ function oxphp_is_worker(): bool {}
  * }
  */
 function oxphp_is_streaming(): bool {}
-
-/**
- * Extends the request timeout to prevent the server from killing
- * long-running scripts.
- *
- * Call periodically in long-running loops. The timeout is extended
- * by the given number of seconds from the time of the call.
- *
- * @param int $time Seconds to extend the timeout by (default: 10)
- * @return bool Always true
- *
- * @example
- * foreach ($large_dataset as $row) {
- *     oxphp_request_heartbeat(30);
- *     process($row);
- * }
- */
-function oxphp_request_heartbeat(int $time = 10): bool {}
 
 /**
  * Activate streaming mode and flush buffered output as a chunk to the client.
@@ -248,6 +237,12 @@ function oxphp_usleep(int $microseconds): void {}
  *     $app->handle();  // called per request
  * });
  * $app->terminate();  // graceful shutdown
+ *
+ * @see \OxPHP\Server\Worker::serve() Object-oriented equivalent. Both share
+ *      the same dispatch loop and per-thread re-entry guard, but differ at
+ *      the boundary: oxphp_worker() emits E_WARNING and returns false when
+ *      called outside worker mode, whereas Worker::serve() throws
+ *      InvalidServeContextException and returns void.
  */
 function oxphp_worker(callable $handler): bool {}
 
@@ -289,7 +284,7 @@ function oxphp_async(\Closure $closure, mixed ...$args): int|false {}
  * @param float|null $timeout Maximum seconds to wait, null = wait indefinitely
  * @return mixed The return value of the closure
  *
- * @throws \OxPHP\Async\Exception If the closure threw an exception or called die()/exit()
+ * @throws \OxPHP\Async\AsyncException If the closure threw an exception or called die()/exit()
  * @throws \OxPHP\Async\TimeoutException If the timeout expired before completion
  *
  * @example
@@ -315,7 +310,7 @@ function oxphp_async_await(int $promise_id, ?float $timeout = null): mixed {}
  * @param float|null $timeout Per-promise timeout in seconds, null = no limit
  * @return array<int, mixed> Map of promise ID => result value
  *
- * @throws \OxPHP\Async\Exception If any promise fails
+ * @throws \OxPHP\Async\AsyncException If any promise fails
  * @throws \OxPHP\Async\TimeoutException If any promise times out
  *
  * @example
@@ -340,15 +335,57 @@ function oxphp_async_await_all(array $promise_ids, ?float $timeout = null): arra
  * @param float|null $timeout Overall timeout in seconds, null = no limit
  * @return array{id: int, value: mixed} The winning promise ID and its result
  *
- * @throws \OxPHP\Async\Exception If the winning promise threw an exception
+ * @throws \OxPHP\Async\AsyncException If the winning promise threw an exception
  * @throws \OxPHP\Async\TimeoutException If no promise completes within timeout
  *
  * @example
  * $p1 = oxphp_async(fn() => slow_api_a());
  * $p2 = oxphp_async(fn() => slow_api_b());
- * $winner = oxphp_async_await_any([$p1, $p2]);
+ * $winner = oxphp_async_await_race([$p1, $p2]);
  * // ['id' => $p2, 'value' => ...] (whichever finished first)
  * $other = oxphp_async_await($p1); // non-winner still awaitable
+ */
+function oxphp_async_await_race(array $promise_ids, ?float $timeout = null): array {}
+
+/**
+ * Wait for the first FULFILLED promise (analog of JavaScript Promise.any).
+ *
+ * Unlike oxphp_async_await_race(), rejections do NOT win — they accumulate.
+ * If at least one promise fulfills before the deadline, returns its id+value
+ * and leaves remaining pending promises individually awaitable. If every
+ * promise rejects, throws AggregateAsyncException carrying all errors.
+ *
+ * On timeout, throws TimeoutException populated with partial errors collected
+ * up to the deadline and the ids of promises still pending. Pending promises
+ * are cancelled AND their receivers are dropped — those ids cannot be re-awaited
+ * with oxphp_async_await*() afterwards (each such call throws
+ * "unknown or already-awaited promise id"). The pending list is an audit
+ * trail, not a queue of resumable work.
+ *
+ * @param int[]      $promise_ids Array of promise IDs from oxphp_async()
+ * @param float|null $timeout     Overall timeout in seconds; null = no limit
+ * @return array{id: int, value: mixed} The first-fulfilled promise's id and result
+ *
+ * @throws \OxPHP\Async\AggregateAsyncException If every promise rejects
+ * @throws \OxPHP\Async\TimeoutException        If the deadline elapses before any fulfills
+ *
+ * @example
+ * $a = oxphp_async(fn() => fetch_mirror_a());
+ * $b = oxphp_async(fn() => fetch_mirror_b());
+ * try {
+ *     $winner = oxphp_async_await_any([$a, $b], 2.0);
+ *     // ['id' => $a or $b, 'value' => ...]
+ * } catch (\OxPHP\Async\AggregateAsyncException $e) {
+ *     foreach ($e->getErrors() as $i => $err) {
+ *         // by input position
+ *     }
+ * } catch (\OxPHP\Async\TimeoutException $e) {
+ *     foreach ($e->getPartialErrors() as $promise_id => $err) {
+ *         // who failed
+ *     }
+ *     $cancelled = $e->getCancelledPromiseIds();
+ *     // Audit-only: these ids are no longer awaitable.
+ * }
  */
 function oxphp_async_await_any(array $promise_ids, ?float $timeout = null): array {}
 
@@ -777,12 +814,68 @@ namespace OxPHP\Async {
      * The message contains the original exception class and message:
      * "Async task failed: [DomainException] invalid value"
      */
-    class Exception extends \Exception {}
+    class AsyncException extends \Exception {}
 
     /**
-     * Thrown when oxphp_async_await() times out before the task completes.
+     * Thrown by async-await-style functions when a deadline expires.
+     *
+     * For oxphp_async_await_any(), additional context is exposed via
+     * getPartialErrors() and getCancelledPromiseIds(). For other call sites
+     * (oxphp_async_await, oxphp_async_await_all, oxphp_async_await_race)
+     * both methods return empty arrays.
      */
-    class TimeoutException extends Exception {}
+    class TimeoutException extends AsyncException
+    {
+        /**
+         * Errors collected from promises that rejected before the deadline,
+         * keyed by promise_id. Only populated by oxphp_async_await_any().
+         *
+         * @return array<int, \Throwable>
+         */
+        public function getPartialErrors(): array {}
+
+        /**
+         * Promise IDs that did not settle before the deadline. The cancel
+         * flag has been set on each, AND their receivers were dropped —
+         * passing any of these ids to oxphp_async_await() /
+         * oxphp_async_await_race() / oxphp_async_await_any() /
+         * oxphp_async_await_all() afterwards throws OxPHP\Async\AsyncException
+         * ("unknown or already-awaited promise id"). Treat the list as a
+         * fire-and-forget audit trail, not a queue of resumable work. Only
+         * populated by oxphp_async_await_any().
+         *
+         * @return list<int>
+         */
+        public function getCancelledPromiseIds(): array {}
+    }
+
+    /**
+     * Thrown by oxphp_async_await_any() when every provided promise rejected
+     * before any could fulfill (analog of JavaScript AggregateError).
+     */
+    class AggregateAsyncException extends AsyncException
+    {
+        /**
+         * Errors in the order of the input promise_ids array.
+         *
+         * @return list<\Throwable>
+         */
+        public function getErrors(): array {}
+
+        /**
+         * Errors keyed by promise_id (input order preserved as values).
+         *
+         * @return array<int, \Throwable>
+         */
+        public function getErrorMap(): array {}
+
+        /**
+         * Promise IDs in the order of the input array.
+         *
+         * @return list<int>
+         */
+        public function getPromiseIds(): array {}
+    }
 
     /**
      * Thrown by every access to a BorrowedProxy — proxies substituted for
@@ -924,6 +1017,28 @@ namespace OxPHP\Decorator {
 namespace OxPHP\Shared {
 
     /**
+     * # Timeout convention (Shared\*)
+     *
+     * Every bounded-wait method in `OxPHP\Shared\` follows the same
+     * trichotomy — there is no `?float $timeout`:
+     *
+     *  * a bare method ({@see Pool::acquire}, {@see Mutex::withLock},
+     *    {@see Channel::recv}) waits **forever**;
+     *  * a `try*` method ({@see Pool::tryAcquire}, {@see Channel::tryRecv})
+     *    is **non-blocking**;
+     *  * a `*Timeout(int $ms)` method ({@see Pool::acquireTimeout},
+     *    {@see Mutex::withLockTimeout}, {@see Channel::recvTimeout}) waits a
+     *    **bounded** number of milliseconds. `$ms` must be `> 0`, otherwise
+     *    {@see TypeException}.
+     *
+     * Where an outcome is *expected*, it is returned as an object rather than
+     * thrown: Channel uses {@see Channel\RecvResult} / {@see Channel\SendResult};
+     * {@see Pool::tryAcquire} returns `null` on a saturated pool. A bounded
+     * wait that expires raises {@see OperationTimeoutException}, which extends
+     * {@see \OxPHP\Async\AsyncException} — NOT {@see SharedException}.
+     */
+
+    /**
      * Marker interface implemented by every Shared\* type.
      *
      * Values that implement Shareable may be stored inside container
@@ -931,50 +1046,147 @@ namespace OxPHP\Shared {
      * without being serialised. Plain PHP objects cannot — the runtime
      * rejects them with {@see TypeException}.
      *
-     * Implemented internally by Counter, Flag, Once, Mutex, Channel, Map,
-     * Pool. User code cannot implement this interface directly.
+     * Implemented internally by Atomic, Counter, Flag, Once, Mutex, Channel,
+     * Map, Pool. User code cannot implement this interface directly.
      */
     interface Shareable {}
 
     /**
+     * Memory-ordering constraint for {@see Atomic} operations, mirroring the
+     * C++/Rust `memory_order` model.
+     *
+     * Stronger orderings cost more on weakly-ordered CPUs (ARM, POWER) but
+     * are nearly free on x86. The default for every Atomic method is
+     * `SeqCst` — correct everywhere, only sometimes slower than necessary.
+     *
+     * Not every method accepts every case:
+     *
+     *  * {@see Atomic::load} — `Relaxed`, `Acquire`, `SeqCst`
+     *  * {@see Atomic::store} — `Relaxed`, `Release`, `SeqCst`
+     *  * {@see Atomic::compareAndSet} `$failure` — `Relaxed`, `Acquire`, `SeqCst`
+     *  * read-modify-write ({@see Atomic::swap}, the `fetch*` family, and
+     *    {@see Atomic::compareAndSet} `$success`) — any case
+     *
+     * Passing a disallowed case throws {@see InvalidOrderingException}.
+     */
+    enum Ordering: int
+    {
+        /** No ordering constraint beyond the operation's own atomicity. */
+        case Relaxed = 0;
+        /** Later reads/writes cannot be reordered before this load. */
+        case Acquire = 1;
+        /** Earlier reads/writes cannot be reordered after this store. */
+        case Release = 2;
+        /** Acquire (on the load half) + Release (on the store half) for RMW ops. */
+        case AcqRel = 3;
+        /** Sequential consistency: a single total order seen by all threads. */
+        case SeqCst = 4;
+    }
+
+    /**
      * Atomic signed 64-bit counter, visible from every PHP worker thread.
      *
-     * All operations are lock-free (`SeqCst`). Use Counter for rate
-     * counters, progress trackers, sequence generators, or any shared
-     * integer state that would otherwise require Redis INCR.
+     * All operations are lock-free and `Relaxed`: each is atomic (no lost
+     * ticks, no torn reads) but establishes no happens-before with other
+     * memory. Use Counter for rate counters, progress trackers, sequence
+     * generators, or any shared integer state that would otherwise require
+     * Redis INCR. To synchronise other memory through the integer, use
+     * {@see Atomic} (with an explicit {@see Ordering}).
      *
-     * @link docs/en/features/shared-counter.md
+     * @link docs/en/shared-state/shared-counter.md
      */
     final class Counter implements Shareable
     {
         public function __construct(int $initial = 0) {}
 
-        /** Current value. */
+        /** Current value (atomic load). */
         public function get(): int {}
 
-        /** Set to `$value`, returning the previous value. */
+        /** Set to `$value`, returning the previous value (atomic exchange; set(0) resets a window). */
         public function set(int $value): int {}
 
-        /** Atomically add `$by` (default 1), returning the new value. */
-        public function inc(int $by = 1): int {}
-
-        /** Atomically subtract `$by` (default 1), returning the new value. */
-        public function dec(int $by = 1): int {}
-
-        /** Atomically add `$delta` (may be negative), returning the new value. */
-        public function add(int $delta): int {}
+        /** Atomically add `$delta` (default 1; may be negative), returning the new value. */
+        public function add(int $delta = 1): int {}
 
         /**
-         * Compare-and-set. Returns true if the swap succeeded (current
-         * value was `$expect`), false otherwise.
+         * Compare-and-set. Returns true if the current value was `$expect`
+         * and was replaced with `$new`, false otherwise. Relaxed ordering;
+         * for ordered CAS use {@see Atomic}.
          */
         public function compareAndSet(int $expect, int $new): bool {}
 
-        /** Atomic sum of `$deltas`, returning the new value. */
-        public function addBatch(array $deltas): int {}
+        /** Registry ID for this instance. */
+        public function id(): int {}
+    }
 
-        /** Reset to `$newValue` (default 0), returning the previous value. */
-        public function reset(int $newValue = 0): int {}
+    /**
+     * Generic atomic signed 64-bit integer with explicit memory-ordering
+     * control, visible from every PHP worker thread.
+     *
+     * Where {@see Counter} is a fixed-`Relaxed` accumulator surface, Atomic
+     * exposes the full lock-free toolkit — load/store/swap, compare-and-set,
+     * and fetch arithmetic/bitwise — each taking an {@see Ordering} so
+     * latency-sensitive code can relax barriers it does not need. Use it for
+     * lock-free state machines, sequence numbers, bitmask flags, and
+     * seqlock-style protocols.
+     *
+     * Every method defaults to `Ordering::SeqCst`; pass a weaker ordering
+     * only when you can prove it correct. A disallowed ordering for a given
+     * method throws {@see InvalidOrderingException}.
+     *
+     * @link docs/en/shared-state/shared-atomic.md
+     */
+    final class Atomic implements Shareable
+    {
+        public function __construct(int $initial = 0) {}
+
+        /**
+         * Atomically read the current value.
+         *
+         * @param Ordering $order One of Relaxed, Acquire, SeqCst.
+         */
+        public function load(Ordering $order = Ordering::SeqCst): int {}
+
+        /**
+         * Atomically store `$value`.
+         *
+         * @param Ordering $order One of Relaxed, Release, SeqCst.
+         */
+        public function store(int $value, Ordering $order = Ordering::SeqCst): void {}
+
+        /** Atomically store `$value`, returning the previous value. */
+        public function swap(int $value, Ordering $order = Ordering::SeqCst): int {}
+
+        /**
+         * Compare-and-set. If the current value equals `$expect`, replace it
+         * with `$new` and return true; otherwise leave it unchanged and
+         * return false.
+         *
+         * @param Ordering $success Ordering applied on a successful swap (any case).
+         * @param Ordering $failure Ordering applied on failure — one of
+         *                          Relaxed, Acquire, SeqCst.
+         */
+        public function compareAndSet(
+            int $expect,
+            int $new,
+            Ordering $success = Ordering::SeqCst,
+            Ordering $failure = Ordering::SeqCst,
+        ): bool {}
+
+        /** Atomically add `$delta` (may be negative), returning the previous value. */
+        public function fetchAdd(int $delta, Ordering $order = Ordering::SeqCst): int {}
+
+        /** Atomically subtract `$delta`, returning the previous value. */
+        public function fetchSub(int $delta, Ordering $order = Ordering::SeqCst): int {}
+
+        /** Atomically bitwise-AND with `$mask`, returning the previous value. */
+        public function fetchAnd(int $mask, Ordering $order = Ordering::SeqCst): int {}
+
+        /** Atomically bitwise-OR with `$mask`, returning the previous value. */
+        public function fetchOr(int $mask, Ordering $order = Ordering::SeqCst): int {}
+
+        /** Atomically bitwise-XOR with `$mask`, returning the previous value. */
+        public function fetchXor(int $mask, Ordering $order = Ordering::SeqCst): int {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
@@ -983,31 +1195,49 @@ namespace OxPHP\Shared {
     /**
      * Atomic boolean flag, visible from every PHP worker thread.
      *
-     * Use Flag for feature toggles, circuit-breaker state, shutdown
-     * signals — anything that fits a single yes/no switch.
+     * The bool twin of {@see Atomic}: lock-free load/store/swap/compareAndSet
+     * with explicit memory ordering. Use Flag for feature toggles,
+     * circuit-breaker state, shutdown signals, one-shot init markers — any
+     * single cross-worker yes/no switch.
      *
-     * @link docs/en/features/shared-flag.md
+     * @link docs/en/shared-state/shared-flag.md
      */
     final class Flag implements Shareable
     {
         public function __construct(bool $initial = false) {}
 
-        /** Current value. */
-        public function test(): bool {}
-
-        /** Atomically set to true, returning the previous value. */
-        public function set(): bool {}
-
-        /** Atomically set to false, returning the previous value. */
-        public function clear(): bool {}
+        /**
+         * Atomically read the current value.
+         *
+         * @param Ordering $order One of Relaxed, Acquire, SeqCst.
+         */
+        public function load(Ordering $order = Ordering::SeqCst): bool {}
 
         /**
-         * Compare-and-set. Returns true if the swap succeeded.
+         * Atomically store `$value`.
+         *
+         * @param Ordering $order One of Relaxed, Release, SeqCst.
          */
-        public function compareAndSet(bool $expect, bool $new): bool {}
+        public function store(bool $value, Ordering $order = Ordering::SeqCst): void {}
 
-        /** Atomically set to `$new`, returning the previous value. */
-        public function exchange(bool $new): bool {}
+        /** Atomically store `$value`, returning the previous value. */
+        public function swap(bool $value, Ordering $order = Ordering::SeqCst): bool {}
+
+        /**
+         * Compare-and-set. If the current value equals `$expect`, replace it
+         * with `$new` and return true; otherwise leave it unchanged and
+         * return false.
+         *
+         * @param Ordering $success Ordering applied on a successful swap (any case).
+         * @param Ordering $failure Ordering applied on failure — one of
+         *                          Relaxed, Acquire, SeqCst.
+         */
+        public function compareAndSet(
+            bool $expect,
+            bool $new,
+            Ordering $success = Ordering::SeqCst,
+            Ordering $failure = Ordering::SeqCst,
+        ): bool {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
@@ -1021,84 +1251,135 @@ namespace OxPHP\Shared {
      * expensive singletons) where every worker may race to request
      * the value on first touch.
      *
-     * @link docs/en/features/shared-once.md
+     * @link docs/en/shared-state/shared-once.md
+     */
+    /**
+     * @template T
      */
     final class Once implements Shareable
     {
-        public function __construct() {}
+        /**
+         * @param Once\FailureMode $onFactoryError What happens to OTHER callers
+         *        if a `getOrInit()` factory throws. Default `Reset` (retryable);
+         *        `Poison` makes the cell terminally unusable.
+         */
+        public function __construct(
+            Once\FailureMode $onFactoryError = Once\FailureMode::Reset
+        ) {}
 
         /**
          * Returns the stored value.
          *
-         * @throws UninitializedException If `init()`/`trySet()` has not succeeded yet.
+         * @return T
+         * @throws UninitializedException If the cell is empty or a factory is
+         *         currently running (Pending) with no value published yet.
+         * @throws PoisonedException If a factory previously failed in `Poison` mode.
          */
         public function get(): mixed {}
 
-        /** Whether `init()`/`trySet()` has completed. */
-        public function isInitialized(): bool {}
+        /**
+         * State of the cell, for introspection / diagnostics. Never throws —
+         * including on a poisoned cell (this is the one safe observer of poison).
+         */
+        public function status(): Once\Status {}
 
         /**
-         * Set to `$value` iff not yet initialised. Returns true on success,
-         * false if already set.
+         * Push model: atomically store `$value` iff the cell is empty.
+         *
+         * For values WITHOUT side-effecting acquisition only. Initialise
+         * resources (handles, sockets) through `getOrInit()` — a `trySet()`
+         * that loses the race merely drops a value to GC, but a resource
+         * acquired before a lost race would orphan.
+         *
+         * @param T $value
+         * @return bool true if this call stored the value; false if the cell
+         *         was already Ready or Pending. A false on Pending does NOT
+         *         guarantee a later get() succeeds — a Reset-mode factory can
+         *         still fail and clear the cell. If you need the value back,
+         *         use getOrInit().
+         * @throws PoisonedException If the cell is poisoned.
          */
         public function trySet(mixed $value): bool {}
 
         /**
-         * Invoke `$factory` once and store its return value. If another
-         * caller is already running the factory, blocks until it finishes
-         * and returns the stored value.
+         * Pull model: return the value, or compute it exactly once. Parallel
+         * callers block on the winner and receive its value on success. If the
+         * winner's factory throws in Reset mode the next blocked caller becomes
+         * the initialiser and retries; in Poison mode the cell goes terminal.
+         * The factory's own exception is always re-thrown to the current caller.
          *
-         * @throws DeadlockException If the same thread reenters `init()`.
+         * @param callable(): T $factory
+         * @return T
+         * @throws DeadlockException If the same thread reenters `getOrInit()`.
+         * @throws PoisonedException If the cell is already poisoned.
          */
-        public function init(callable $factory): mixed {}
+        public function getOrInit(callable $factory): mixed {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
     }
 
     /**
-     * Poisoning mutex guarding a stored value.
+     * Cross-thread mutual exclusion guarding a stored value.
      *
-     * If the callable passed to `with()` / `tryWith()` throws, the mutex
-     * becomes poisoned and further acquisitions throw
-     * {@see PoisonedException} until `clearPoison()` is called — this
-     * prevents callers from reading a value left in an inconsistent
-     * half-updated state.
+     * Three method variants encode the wait policy explicitly:
      *
-     * @link docs/en/features/shared-mutex.md
+     *   - {@see withLock()}        — block until acquired (forever, or
+     *     fiber cancellation).
+     *   - {@see tryWithLock()}     — non-blocking; throws
+     *     {@see ContentionException} if the lock is held.
+     *   - {@see withLockTimeout()} — bounded wait; throws
+     *     {@see OperationTimeoutException} on deadline.
+     *
+     * If the callable throws an ordinary PHP exception, the lock is
+     * released and the exception propagates — the mutex is NOT corrupted
+     * (partial mutation is acceptable; caller is responsible for invariant
+     * restoration).
+     *
+     * If a Rust panic crosses the FFI boundary (a server bug), the mutex
+     * enters a sticky corrupted state and every subsequent acquisition
+     * throws {@see CorruptedMutexException}. There is no API to clear
+     * corruption — discard the instance and create a new one.
+     *
+     * @link docs/en/shared-state/shared-mutex.md
      */
     final class Mutex implements Shareable
     {
-        /**
-         * @param mixed      $initial        Starting value.
-         * @param float|null $defaultTimeout Default `with()` timeout in seconds (null = wait forever).
-         */
-        public function __construct(mixed $initial = null, ?float $defaultTimeout = null) {}
-
-        /** Whether the mutex is in a poisoned state. */
-        public function isPoisoned(): bool {}
-
-        /** Clear the poisoned state so `with()` can acquire again. */
-        public function clearPoison(): bool {}
+        /** @param mixed $initial Starting value. */
+        public function __construct(mixed $initial = null) {}
 
         /**
-         * Acquire the lock, invoke `$fn` with the stored value (mutable by
+         * Acquire the lock (waiting forever, or until the request fiber
+         * is cancelled), invoke `$fn` with the stored value (mutable by
          * reference), and release. Returns `$fn`'s return value.
          *
-         * @param float $timeout Seconds to wait; 0.0 = use the constructor default.
-         *
-         * @throws TimeoutException  On timeout.
-         * @throws PoisonedException If the mutex was poisoned.
+         * @throws CorruptedMutexException If a prior closure invocation
+         *         crashed via Rust panic and left the mutex unusable.
+         * @throws DeadlockException If a wait-for cycle is detected.
          */
-        public function with(callable $fn, float $timeout = 0.0): mixed {}
+        public function withLock(callable $fn): mixed {}
 
         /**
-         * Non-blocking variant of `with()`. Returns null without invoking
-         * `$fn` if the lock is contended.
+         * Non-blocking variant of {@see withLock()}.
          *
-         * @throws PoisonedException If the mutex was poisoned.
+         * @throws ContentionException If the lock is currently held.
+         * @throws CorruptedMutexException If the mutex is unusable.
          */
-        public function tryWith(callable $fn): mixed {}
+        public function tryWithLock(callable $fn): mixed {}
+
+        /**
+         * Bounded-wait variant of {@see withLock()}.
+         *
+         * @param int $ms Wait budget in milliseconds. Must be `> 0` — use
+         *                {@see withLock()} for forever or
+         *                {@see tryWithLock()} for non-blocking.
+         *
+         * @throws OperationTimeoutException If the deadline expires.
+         * @throws CorruptedMutexException If the mutex is unusable.
+         * @throws DeadlockException If a wait-for cycle is detected.
+         * @throws TypeException If `$ms` is not a positive int.
+         */
+        public function withLockTimeout(callable $fn, int $ms): mixed {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
@@ -1108,174 +1389,239 @@ namespace OxPHP\Shared {
      * Bounded multi-producer / multi-consumer queue with fiber-aware
      * blocking send / recv.
      *
-     * When the channel is full, `send()` suspends the calling fiber; when
-     * empty, `recv()` suspends. Outside a fiber the calls block the worker
-     * thread. Use Channel for fan-out/fan-in work pipelines across workers.
+     * Two return-style conventions live side-by-side:
      *
-     * @link docs/en/features/shared-channel.md
+     *   - **Channel produces results** via {@see Channel\RecvResult} /
+     *     {@see Channel\SendResult}. Closed / full / timeout are NORMAL
+     *     outcomes for channels (fan-out dispatchers see them daily),
+     *     so they appear as result variants — no exceptions in the hot path.
+     *
+     *   - **Mutex throws** on contention / timeout. The asymmetry is
+     *     deliberate: long-held contention is a design smell for mutexes,
+     *     but routine for channels.
+     *
+     * Three wait policies per direction:
+     *
+     *   - `try*`        non-blocking
+     *   - (bare)        block forever (or until the request fiber is cancelled)
+     *   - `*Timeout`    bounded wait, `int $ms > 0`
+     *
+     * @link docs/en/shared-state/shared-channel.md
      */
-    final class Channel implements Shareable
+    final class Channel implements Shareable, \Countable
     {
-        /** @param int $capacity Maximum queued values (>= 1). */
+        /**
+         * @param int $capacity Maximum queued values (>= 1).
+         * @throws TypeException If `$capacity` is not a positive int.
+         * @throws CapacityException If the requested capacity's slot array
+         *         would exceed `SHARED_MAX_CHANNEL_BYTES` (default 64 MiB).
+         */
         public function __construct(int $capacity) {}
 
-        /**
-         * Non-blocking send. Returns false if the channel is full or closed.
-         */
-        public function trySend(mixed $value): bool {}
+        // ── Receive ────────────────────────────────────────────────
+
+        /** Non-blocking receive. Returns Ok / Empty / Closed. */
+        public function tryRecv(): Channel\RecvResult {}
+
+        /** Block until a value arrives or the channel closes. */
+        public function recv(): Channel\RecvResult {}
 
         /**
-         * Blocking send. Waits up to `$timeout` seconds (0.0 = forever).
+         * Bounded receive.
          *
-         * @throws TimeoutException On timeout.
-         * @throws ClosedException  If the channel was closed.
+         * @param int $ms Wait budget in milliseconds. Must be `> 0`.
+         * @throws TypeException If `$ms` is not a positive int.
          */
-        public function send(mixed $value, float $timeout = 0.0): bool {}
+        public function recvTimeout(int $ms): Channel\RecvResult {}
+
+        // ── Send ───────────────────────────────────────────────────
 
         /**
-         * Non-blocking receive. Returns null if the channel is empty.
-         * Use `pending()` to distinguish an empty channel from a `null` value.
+         * Non-blocking send. Returns Ok / Full / Closed.
          *
-         * @throws ClosedException If the channel was closed and drained.
+         * @throws ValueTooLargeException If `$value`'s serialised size exceeds
+         *         the per-value cap (`SHARED_MAX_VALUE_SIZE`, default 1 MiB).
          */
-        public function tryRecv(float $timeout = 0.0): mixed {}
+        public function trySend(mixed $value): Channel\SendResult {}
 
         /**
-         * Blocking receive. Waits up to `$timeout` seconds (0.0 = forever).
+         * Block until a slot frees or the channel closes.
          *
-         * @throws TimeoutException On timeout.
-         * @throws ClosedException  If the channel was closed and drained.
+         * @throws ValueTooLargeException If `$value`'s serialised size exceeds
+         *         the per-value cap (`SHARED_MAX_VALUE_SIZE`, default 1 MiB).
          */
-        public function recv(float $timeout = 0.0): mixed {}
+        public function send(mixed $value): Channel\SendResult {}
 
-        /** Close the channel. Subsequent sends fail; pending recvs drain remaining values then throw. */
+        /**
+         * Bounded send.
+         *
+         * @param int $ms Wait budget in milliseconds. Must be `> 0`.
+         * @throws TypeException If `$ms` is not a positive int.
+         * @throws ValueTooLargeException If `$value` exceeds the per-value cap.
+         */
+        public function sendTimeout(mixed $value, int $ms): Channel\SendResult {}
+
+        // ── Batch ──────────────────────────────────────────────────
+
+        /**
+         * Send up to N values within a deadline. Returns the count
+         * actually accepted. Never throws on full / closed / timeout —
+         * use the return value to detect partial progress.
+         *
+         * @param int $ms Wait budget in milliseconds. Must be `> 0`.
+         * @throws TypeException If `$ms` is not a positive int.
+         * @throws ValueTooLargeException If any element exceeds the per-value
+         *         cap; the whole batch is rejected (0 sent).
+         */
+        public function sendMany(array $values, int $ms): int {}
+
+        /**
+         * Receive up to `$max` values within a deadline. Returns a
+         * partial array (possibly empty) on timeout or close.
+         *
+         * @param int $ms Wait budget in milliseconds. Must be `> 0`.
+         * @return array<int, mixed>
+         * @throws TypeException If `$ms` is not a positive int.
+         */
+        public function recvMany(int $max, int $ms): array {}
+
+        // ── Lifecycle ──────────────────────────────────────────────
+
+        /** Close the channel. Subsequent sends produce SendResult::Closed. */
         public function close(): bool {}
 
         /** Whether the channel is closed. */
         public function isClosed(): bool {}
 
-        /** Current number of queued values. */
-        public function pending(): int {}
-
-        /**
-         * Batched send. Returns the number of values actually accepted
-         * before the channel became full / closed or the timeout expired.
-         */
-        public function sendMany(array $values, float $timeout = 0.0): int {}
-
-        /**
-         * Batched receive. Drains up to `$max` values, blocking only for
-         * the first one up to `$timeout` seconds.
-         *
-         * @return array<int, mixed>
-         */
-        public function recvMany(int $max, float $timeout = 0.0): array {}
+        /** Current number of queued values. Implements `Countable`. */
+        public function count(): int {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
     }
 
     /**
-     * Concurrent `string → mixed` key-value store, visible from every
+     * Concurrent `int|string → mixed` key-value store, visible from every
      * worker thread.
      *
-     * Nested {@see Shareable} values are stored as refcount-managed
-     * references without serialisation. Cycle insertion is rejected
-     * with {@see CycleException}. Per-instance cap via `maxEntries`.
+     * `null` is never a stored value — it is the absence sentinel across
+     * the whole API: a `null` return means "no such key", and writing a
+     * `null` value throws {@see TypeException}. Keys are `int` or `string`,
+     * kept distinct (`123` and `"123"` are different keys; no PHP key
+     * coercion); string keys are binary-safe (stored as opaque bytes, so
+     * non-UTF-8 keys round-trip faithfully). Nested {@see Shareable} values
+     * are stored as
+     * refcount-managed references without serialisation; cycle insertion is
+     * rejected with {@see CycleException}. `maxEntries` is an approximate
+     * per-instance ceiling.
      *
-     * @link docs/en/features/shared-map.md
+     * @link docs/en/shared-state/shared-map.md
      */
     final class Map implements Shareable
     {
         /**
-         * @param int|null $maxEntries Per-instance size cap, or null for unlimited
-         *                             (still bounded by the process-global
-         *                             `SHARED_MAX_ENTRIES` budget).
+         * @param int|null $maxEntries Approximate per-instance ceiling for
+         *        OOM-safety, or null for unbounded (still bounded by the
+         *        process-global `SHARED_MAX_ENTRIES` budget). Must be > 0;
+         *        0 or negative throws {@see TypeException}.
          */
         public function __construct(?int $maxEntries = null) {}
 
-        /** Read a value; returns `$default` when absent. */
-        public function get(string $key, mixed $default = null): mixed {}
+        /** Value for `$key`, or `null` if absent. */
+        public function get(int|string $key): mixed {}
 
         /**
-         * Write a value.
+         * Lazily stream `key => value` for `$keys`; absent keys are skipped.
+         * Returns a native lazy iterator — one value is materialised at a
+         * time and `break` stops further work.
          *
-         * @throws TypeException     Value is not a scalar, array of scalars, or Shareable.
-         * @throws CycleException    Writing this Shareable would form a reference cycle.
-         * @throws CapacityException Map reached `maxEntries` or the process cap.
+         * @param iterable<int|string> $keys
+         * @return \Iterator<int|string, mixed>
          */
-        public function set(string $key, mixed $value): void {}
+        public function getMany(iterable $keys): \Iterator {}
 
-        /** Whether a key exists. */
-        public function has(string $key): bool {}
-
-        /** Remove a key, returning the previous value or null. */
-        public function remove(string $key): mixed {}
-
-        /** Remove all entries. */
-        public function clear(): int {}
-
-        /** Number of entries currently stored. */
+        /** Approximate entry count (striped, weakly consistent). */
         public function count(): int {}
 
+        /** Configured per-instance ceiling, or null if unbounded. */
+        public function maxEntries(): ?int {}
+
         /**
-         * Snapshot of all keys at the call time.
+         * Insert or overwrite.
          *
-         * @return string[]
+         * @throws TypeException          `$value` is null, or not a scalar /
+         *                                array of supported / Shareable.
+         * @throws ValueTooLargeException Serialised value exceeds the per-value
+         *                                cap (`SHARED_MAX_VALUE_SIZE`).
+         * @throws CycleException         Storing this Shareable would form a cycle.
+         * @throws CapacityException      New key while at `maxEntries`.
          */
-        public function keys(): array {}
-
-        /** Configured per-instance cap, or null if unlimited. */
-        public function maxEntries(): mixed {}
+        public function set(int|string $key, mixed $value): void {}
 
         /**
-         * Set `$value` iff the key was absent. Returns true on insert,
-         * false if the key already existed.
-         */
-        public function setIfAbsent(string $key, mixed $value): bool {}
-
-        /**
-         * Atomically update a value with `$fn(mixed $old): mixed`. Returns
-         * the new value. Throws {@see TypeException} for unsupported values.
-         */
-        public function update(string $key, callable $fn): mixed {}
-
-        /**
-         * Return the current value, or call `$factory()` to compute and
-         * store a new value if the key is absent.
-         */
-        public function getOrSet(string $key, callable $factory): mixed {}
-
-        /**
-         * Bulk set. Returns the number of entries written.
+         * Insert iff absent. Returns the existing value, or `null` if the
+         * insert happened (`null` ⟺ inserted). Atomic.
          *
-         * @param array<string, mixed> $kv
+         * @throws TypeException|ValueTooLargeException|CycleException|CapacityException
          */
-        public function setMany(array $kv): int {}
+        public function setIfAbsent(int|string $key, mixed $value): mixed {}
 
         /**
-         * Bulk get.
+         * Bulk insert/overwrite. Per-key atomic, NOT batch-atomic: keys are
+         * applied one at a time, so a mid-batch failure leaves earlier keys
+         * stored (partial apply). The successfully-written count is not
+         * recoverable once an exception is thrown — re-read with `getMany`
+         * if you need to know what landed.
          *
-         * @param string[] $keys
-         * @return array<string, mixed>
+         * @param iterable<int|string, mixed> $entries
+         * @return int Number of entries written (only on full success).
+         * @throws TypeException          A null/non-storable value or non-int|string key.
+         * @throws ValueTooLargeException A value over the per-value cap.
+         * @throws CycleException         A value that would form a reference cycle.
+         * @throws CapacityException      A new key past `maxEntries`.
          */
-        public function getMany(array $keys): array {}
+        public function setMany(iterable $entries): int {}
+
+        /** Remove `$key`. Returns whether it existed. No value materialised. */
+        public function remove(int|string $key): bool {}
 
         /**
-         * Bulk atomic update. Applies `$fn` to each of `$keys`; missing
-         * keys are skipped.
+         * Bulk remove. Per-key atomic. Returns the number actually removed.
          *
-         * @param string[] $keys
-         * @return array<string, mixed>
+         * @param iterable<int|string> $keys
          */
-        public function updateMany(array $keys, callable $fn): array {}
+        public function removeMany(iterable $keys): int {}
+
+        /** Remove all entries; returns the number removed. */
+        public function clear(): int {}
+
+        /** Overwrite and return the previous value (`null` ⟺ was absent). */
+        public function swap(int|string $key, mixed $value): mixed {}
+
+        /** Remove and return the previous value (`null` ⟺ was absent). */
+        public function pop(int|string $key): mixed {}
 
         /**
-         * Bulk remove. Returns the number of keys actually removed.
+         * Atomically store `$new` iff the current value equals `$expected`.
+         * `null` is the absence sentinel on both sides:
+         *   ($expected = null, $new = V)    → insert iff absent
+         *   ($expected = A,    $new = B)    → replace iff current === A
+         *   ($expected = A,    $new = null) → remove  iff current === A
+         * Equality is by content (arrays order-sensitive, like `===`).
+         * Returns true iff the swap was applied.
          *
-         * @param string[] $keys
+         * @throws TypeException|ValueTooLargeException|CycleException|CapacityException
          */
-        public function removeMany(array $keys): int {}
+        public function compareAndSet(int|string $key, mixed $expected, mixed $new): bool {}
+
+        /**
+         * Weakly-consistent traversal: `$fn(int|string $key, mixed $value)`
+         * runs with no lock held. Keys deleted mid-traversal are skipped;
+         * late inserts may be missed. Return `false` from `$fn` to stop early.
+         *
+         * @param callable(int|string, mixed): (bool|null) $fn
+         */
+        public function forEach(callable $fn): void {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
@@ -1285,115 +1631,390 @@ namespace OxPHP\Shared {
      * Bounded object pool with per-thread slot affinity and idle-timeout
      * eviction.
      *
-     * Factory runs lazily on first acquire; destroy (if provided) runs
-     * on slot eviction or pool shutdown. `maxSize` is a hard budget —
-     * acquire blocks (or fails with `TimeoutException`) once reached.
+     * Factory runs lazily on first acquire; destroy (if provided) runs on
+     * slot eviction or pool shutdown. `maxSize` is a hard budget — once it
+     * is reached, acquire waits for a free slot (see the namespace-level
+     * timeout convention).
      *
-     * @link docs/en/features/shared-pool.md
+     * @link docs/en/shared-state/shared-pool.md
      */
     final class Pool implements Shareable
     {
         /**
-         * @param callable      $factory               Called to create a pooled resource. Receives no arguments.
-         * @param callable|null $destroy               Called with the resource on eviction/shutdown.
-         * @param int           $maxSize               Hard budget of live slots (default 32).
-         * @param float         $idleTimeout           Seconds of inactivity before a slot is evicted (default 300).
-         * @param float|null    $defaultAcquireTimeout Default acquire timeout; null uses 5.0s.
+         * @param callable      $factory       Creates a pooled resource. Receives no arguments; must return an object.
+         * @param callable|null $destroy       Called with the resource on eviction/shutdown.
+         * @param int           $maxSize       Hard budget of live slots; must be > 0 (default 32).
+         * @param int           $idleTimeoutMs Idle ms before a slot is eligible for eviction; 0 disables eviction (default 300_000).
          */
         public function __construct(
             callable $factory,
             ?callable $destroy = null,
             int $maxSize = 32,
-            float $idleTimeout = 300.0,
-            ?float $defaultAcquireTimeout = 5.0,
+            int $idleTimeoutMs = 300_000,
         ) {}
 
-        /**
-         * Acquire a slot. Returns a Handle scoped to the current thread.
-         *
-         * @param float $timeout Seconds to wait; 0.0 = use the constructor default.
-         *
-         * @throws TimeoutException If the pool is saturated.
-         */
-        public function acquire(float $timeout = 0.0): Pool\Handle {}
+        /** Acquire a slot, waiting forever. Always returns a Handle. */
+        public function acquire(): Pool\Handle {}
 
-        /** Release a handle back to the pool. Idempotent once per handle. */
-        public function release(Pool\Handle $handle): void {}
+        /** Non-blocking acquire. Returns a Handle, or null if the pool is saturated. */
+        public function tryAcquire(): ?Pool\Handle {}
 
         /**
-         * Scope-guarded acquire + release. Invokes `$body($resource)` with
-         * the pooled value and returns whatever it returns, releasing even
-         * on exception.
+         * Acquire a slot within a bounded budget.
          *
-         * @throws TimeoutException If the pool is saturated.
+         * @throws OperationTimeoutException On deadline expiry (extends Async\AsyncException, NOT SharedException).
+         * @throws TypeException If `$ms <= 0`.
          */
-        public function with(callable $body, float $timeout = 0.0): mixed {}
+        public function acquireTimeout(int $ms): Pool\Handle {}
 
-        /** Force-evict idle slots now. Returns the number of slots evicted. */
+        /**
+         * Scope-guard: acquire (forever), invoke `$body($resource)` with the
+         * raw pooled resource, and release the slot afterward — even if
+         * `$body` throws. Returns whatever `$body` returns.
+         */
+        public function with(callable $body): mixed {}
+
+        /**
+         * Scope-guard with a bounded acquire budget.
+         *
+         * @throws OperationTimeoutException On deadline expiry.
+         * @throws TypeException If `$ms <= 0`.
+         */
+        public function withTimeout(callable $body, int $ms): mixed {}
+
+        /** Point-in-time snapshot of pool counters. */
+        public function stats(): Pool\Stats {}
+
+        /** Force-evict all idle slots reachable from this worker now. Returns the count. */
         public function evict(): int {}
-
-        /** Total live slots (in-use + idle). */
-        public function size(): int {}
-
-        /** Slots currently checked out by callers. */
-        public function inUse(): int {}
-
-        /** Idle slots ready to acquire. */
-        public function idle(): int {}
-
-        /** Callers currently blocked in `acquire()`. */
-        public function waiting(): int {}
-
-        /** Configured hard budget. */
-        public function maxSize(): int {}
 
         /** Registry ID for this instance. */
         public function id(): int {}
     }
 
+    /**
+     * Name-keyed process-global handles for `Shared\*`. Identity-by-name
+     * complements identity-by-handle (`new Shared\*()`): every worker /
+     * request that calls a method with the same `$key` converges on the
+     * one entry the registry binds under that key.
+     *
+     * Get-or-create semantics: the factory runs **exactly once** per
+     * successful bind (block-losers across worker threads). On hit, the
+     * factory is ignored. The bound entry is pinned for the process
+     * lifetime — invalidate by mutating in place (`$map->clear()`,
+     * `$counter->set(0)`) or unbind the namespace key with `remove()`.
+     *
+     * Works in both routing modes. In worker mode the named entry
+     * collapses the per-worker bootstrap pattern into one shared
+     * instance; in traditional mode it survives across requests, giving
+     * APCu-style same-host coordination without an external store.
+     *
+     * @see Shareable
+     */
+    final class Registry
+    {
+        /**
+         * Typed get-or-create. Returns the existing `Map` bound under
+         * `$key`, or runs `$factory()` (must return a fresh `Map`),
+         * binds and returns it.
+         *
+         * The exception set is identical for every typed method
+         * (`counter`, `atomic`, `flag`, `once`, `mutex`, `channel`,
+         * `pool`) and for `global` (which never raises `TypeException`).
+         * The list is documented once here and elided on the siblings
+         * to keep the stub readable.
+         *
+         * @throws TypeException If `$key` is bound to a different
+         *                       Shared type, the factory returned the
+         *                       wrong type, or the factory returned a
+         *                       non-Shareable / non-serialisable value.
+         * @throws DeadlockException If called for `$key` from inside
+         *                           its own factory on the same thread
+         *                           (reentrancy), or if a cross-key
+         *                           cycle held the call past the
+         *                           30-second gate timeout.
+         * @throws CapacityException If creating the entry would exceed
+         *                           the `SHARED_MAX_ENTRIES` /
+         *                           `SHARED_MAX_BYTES` caps.
+         * @throws SharedException If the registry is draining
+         *                         (graceful shutdown in progress), or
+         *                         a peer creator won the bind race
+         *                         after this thread's factory finished.
+         * @throws \InvalidArgumentException If `$key` is empty.
+         */
+        public static function map(string $key, callable $factory): Map {}
+
+        /** Typed get-or-create for `Shared\Counter`. See {@see map()} for the full exception list. */
+        public static function counter(string $key, callable $factory): Counter {}
+
+        /** Typed get-or-create for `Shared\Atomic`. See {@see map()} for the full exception list. */
+        public static function atomic(string $key, callable $factory): Atomic {}
+
+        /** Typed get-or-create for `Shared\Flag`. See {@see map()} for the full exception list. */
+        public static function flag(string $key, callable $factory): Flag {}
+
+        /** Typed get-or-create for `Shared\Once`. See {@see map()} for the full exception list. */
+        public static function once(string $key, callable $factory): Once {}
+
+        /** Typed get-or-create for `Shared\Mutex`. See {@see map()} for the full exception list. */
+        public static function mutex(string $key, callable $factory): Mutex {}
+
+        /** Typed get-or-create for `Shared\Channel`. See {@see map()} for the full exception list. */
+        public static function channel(string $key, callable $factory): Channel {}
+
+        /** Typed get-or-create for `Shared\Pool`. See {@see map()} for the full exception list. */
+        public static function pool(string $key, callable $factory): Pool {}
+
+        /**
+         * Untyped escape hatch. Returns whatever is bound under `$key`
+         * (no type guard). On miss, runs `$factory()` which must return
+         * any `Shareable`. Does NOT raise `TypeException` on hit; every
+         * other exception from {@see map()} still applies.
+         */
+        public static function global(string $key, callable $factory): Shareable {}
+
+        /**
+         * Unbind a key and drop its pin. Existing handles continue to
+         * work on the now-anonymous entry; the entry self-deregisters
+         * when its last handle drops. The next typed call under the
+         * same key creates a NEW entry — captured handles do not
+         * automatically converge on it. This is namespace management,
+         * not object teardown.
+         *
+         * @return bool True if a bound key was removed, false if absent.
+         * @throws \InvalidArgumentException If `$key` is empty.
+         */
+        public static function remove(string $key): bool {}
+
+        /**
+         * Currently-bound keys. `Creating` (in-flight first-touch)
+         * slots are NOT included.
+         *
+         * @return list<string>
+         */
+        public static function keys(): array {}
+
+        /**
+         * Estimated bytes across **all** Shared\* entries — named AND
+         * anonymous. Same accounting `SHARED_MAX_BYTES` caps. This is a
+         * static estimate, not RSS; use a heap profiler / cgroups for
+         * the true number.
+         */
+        public static function memoryUsage(): int {}
+
+        /**
+         * Live Shared\* entries (named + anonymous). Transient —
+         * **not** equal to `count(Registry::keys())`, which is the
+         * named namespace only.
+         */
+        public static function count(): int {}
+
+        /**
+         * Registry is a static facade. The constructor is registered on
+         * the class only so the runtime can throw a clear
+         * `SharedException` on `new Registry()` — calling it always
+         * fails. Marked `public` here so static analysers and IDEs see
+         * the same surface the runtime exposes; the `@throws` documents
+         * the unconditional failure.
+         *
+         * @throws SharedException always — Registry cannot be instantiated.
+         */
+        public function __construct() {}
+    }
+
     // ── Exception hierarchy ─────────────────────────────────────
     //
     //   \Exception
-    //     └── OxPHP\Shared\Exception
+    //     ├── OxPHP\Async\AsyncException
+    //     │    ├── OxPHP\Shared\OperationTimeoutException
+    //     │    ├── OxPHP\Shared\ContentionException
+    //     │    └── OxPHP\Shared\DeadlockException
+    //     └── OxPHP\Shared\SharedException
     //          ├── StaleHandleException
     //          ├── TypeException
     //          │    └── CycleException
     //          ├── CapacityException
-    //          ├── ClosedException
-    //          ├── PoisonedException
-    //          ├── TimeoutException
-    //          │    └── DeadlockException
-    //          └── UninitializedException
+    //          ├── ClosedException             (Channel / Once close paths)
+    //          ├── PoisonedException           (deprecated; Once only)
+    //          ├── UninitializedException
+    //          ├── InvalidOrderingException
+    //          └── CorruptedMutexException
 
     /** Base class for every Shared\* exception. */
-    class Exception extends \Exception {}
+    class SharedException extends \Exception {}
 
     /** Operation used a handle whose underlying entry was dropped. */
-    class StaleHandleException extends Exception {}
+    class StaleHandleException extends SharedException {}
 
     /** Value is not storable in the target Shared\* container. */
-    class TypeException extends Exception {}
+    class TypeException extends SharedException {}
 
     /** Map::set would form a cycle via nested Shareable references. */
     class CycleException extends TypeException {}
 
     /** Container is full and cannot accept a new entry. */
-    class CapacityException extends Exception {}
+    class CapacityException extends SharedException {}
 
-    /** Channel was closed and cannot send / drained on recv. */
-    class ClosedException extends Exception {}
+    /**
+     * A single value's serialised size exceeds the per-value cap
+     * (`SHARED_MAX_VALUE_SIZE`, default 1 MiB). Thrown by Map writes.
+     */
+    class ValueTooLargeException extends SharedException {}
 
-    /** Mutex was poisoned by a previous callback throwing mid-update. */
-    class PoisonedException extends Exception {}
+    /**
+     * A receive/send was attempted on a closed {@see Channel}, or a closed
+     * {@see Once} was accessed. (Pool surfaces this only on the internal
+     * shutdown-drain path; it is not part of Pool's user-facing surface,
+     * since Pool has no `close()`.)
+     */
+    class ClosedException extends SharedException {}
 
-    /** Operation exceeded its wait budget. */
-    class TimeoutException extends Exception {}
-
-    /** Reentrant / cross-thread wait would deadlock — extends TimeoutException. */
-    class DeadlockException extends TimeoutException {}
+    /**
+     * @deprecated Once initializer panicked. Removed once Once migrates
+     *             to a Result-style API.
+     */
+    class PoisonedException extends SharedException {}
 
     /** Access to a Once before it was initialised. */
-    class UninitializedException extends Exception {}
+    class UninitializedException extends SharedException {}
+
+    /**
+     * An {@see Atomic} operation was given a memory ordering it does not
+     * permit (e.g. `Acquire` on a store, `Release` on a load).
+     */
+    class InvalidOrderingException extends SharedException {}
+
+    /**
+     * Mutex acquisition failed because a prior closure invocation
+     * crashed via Rust panic and left the mutex unusable. There is
+     * no recovery API — discard the instance.
+     */
+    class CorruptedMutexException extends SharedException {}
+
+    /**
+     * A bounded wait on a Shared\* primitive exceeded its deadline. Thrown
+     * by {@see Mutex::withLockTimeout}, {@see Pool::acquireTimeout} and
+     * {@see Pool::withTimeout}. (Channel's bounded receives/sends report a
+     * timeout via {@see Channel\RecvResult} / {@see Channel\SendResult}
+     * instead of throwing.)
+     *
+     * Extends {@see \OxPHP\Async\AsyncException} so a single
+     * `catch (AsyncException)` sweeps both Shared\* timeouts and Async\*
+     * await timeouts. Note it does NOT extend {@see SharedException}.
+     */
+    class OperationTimeoutException extends \OxPHP\Async\AsyncException {}
+
+    /**
+     * Non-blocking acquisition found the lock held. Thrown by
+     * {@see Mutex::tryWithLock}.
+     */
+    class ContentionException extends \OxPHP\Async\AsyncException {}
+
+    /**
+     * Wait-for cycle detected during a Mutex acquisition. Extends
+     * {@see \OxPHP\Async\AsyncException} (was a child of the removed
+     * Shared\TimeoutException in earlier releases).
+     */
+    class DeadlockException extends \OxPHP\Async\AsyncException {}
+}
+
+namespace OxPHP\Shared\Once {
+
+    /** State of an {@see \OxPHP\Shared\Once} cell. */
+    enum Status
+    {
+        case Uninitialized; // empty, accepts a write
+        case Pending;       // a factory is running right now (some thread)
+        case Ready;         // value published
+        case Poisoned;      // a Poison-mode factory failed — terminal
+    }
+
+    /** Policy for what a failed `getOrInit()` factory does to the cell. */
+    enum FailureMode: int
+    {
+        case Reset = 0;  // failure -> back to Uninitialized (retryable, default)
+        case Poison = 1; // failure -> Poisoned forever
+    }
+}
+
+namespace OxPHP\Shared\Map {
+
+    /**
+     * Lazy key→value iterator returned by {@see \OxPHP\Shared\Map::getMany()}.
+     * Materialises one value at a time and skips keys absent at read time.
+     *
+     * @internal Obtain via {@see \OxPHP\Shared\Map::getMany()}; never construct
+     *           directly.
+     */
+    final class KeyCursor implements \Iterator
+    {
+        public function rewind(): void {}
+        public function valid(): bool {}
+        public function current(): mixed {}
+        public function key(): int|string {}
+        public function next(): void {}
+    }
+}
+
+namespace OxPHP\Shared\Channel {
+
+    /** Discriminant for {@see RecvResult}. */
+    enum RecvStatus
+    {
+        case Ok;
+        case Empty;
+        case Timeout;
+        case Closed;
+    }
+
+    /** Discriminant for {@see SendResult}. */
+    enum SendStatus
+    {
+        case Ok;
+        case Full;
+        case Timeout;
+        case Closed;
+    }
+
+    /**
+     * Result of {@see \OxPHP\Shared\Channel::tryRecv()} / `recv()` /
+     * `recvTimeout()`. Use the `isX()` accessors or `status()` with an
+     * exhaustive `match` to dispatch.
+     */
+    final class RecvResult
+    {
+        public function isOk(): bool {}
+        public function isEmpty(): bool {}
+        public function isTimeout(): bool {}
+        public function isClosed(): bool {}
+
+        /**
+         * Payload when {@see isOk()}, otherwise throws.
+         *
+         * @throws \OxPHP\Shared\SharedException If called on a non-Ok variant.
+         */
+        public function value(): mixed {}
+
+        /** Payload when {@see isOk()}, else `$default`. Never throws. */
+        public function valueOr(mixed $default): mixed {}
+
+        /** Discriminant for exhaustive `match` dispatch. */
+        public function status(): RecvStatus {}
+    }
+
+    /**
+     * Result of {@see \OxPHP\Shared\Channel::trySend()} / `send()` /
+     * `sendTimeout()`. No payload — only a discriminant.
+     */
+    final class SendResult
+    {
+        public function isOk(): bool {}
+        public function isFull(): bool {}
+        public function isTimeout(): bool {}
+        public function isClosed(): bool {}
+
+        public function status(): SendStatus {}
+    }
 }
 
 namespace OxPHP\Shared\Pool {
@@ -1401,21 +2022,64 @@ namespace OxPHP\Shared\Pool {
     /**
      * Scope-bound reference to an acquired Pool slot.
      *
-     * Clone is forbidden. `get()` returns a copy of the underlying resource
-     * that is safe to use within the acquiring thread; on destruction or
-     * explicit release via {@see \OxPHP\Shared\Pool::release()} the slot
-     * returns to the pool.
+     * Clone is forbidden. `get()` returns the pooled value owned by this
+     * acquire — no copy is made, and the slot is exclusive to the acquiring
+     * thread. The slot returns to the pool automatically when the Handle is
+     * destroyed (RAII, including stack unwind on exception), or earlier via
+     * {@see release()}.
      *
-     * @internal Produced by {@see \OxPHP\Shared\Pool::acquire()}; never constructed directly.
+     * @internal Produced by {@see \OxPHP\Shared\Pool::acquire()} /
+     *           {@see \OxPHP\Shared\Pool::tryAcquire()} /
+     *           {@see \OxPHP\Shared\Pool::acquireTimeout()}; never constructed directly.
      */
     final class Handle
     {
         /**
          * The pooled resource. Always call inside the acquiring thread.
          *
-         * @throws \OxPHP\Shared\Exception If the handle has already been released.
+         * @throws \OxPHP\Shared\StaleHandleException If the handle has already been released.
          */
         public function get(): mixed {}
+
+        /**
+         * Return the slot to the pool now, before scope end. Idempotent: a
+         * second call (or a `__destruct` after an explicit release) is a
+         * no-op.
+         */
+        public function release(): void {}
+    }
+
+    /**
+     * Immutable snapshot of {@see \OxPHP\Shared\Pool} counters, returned by
+     * {@see \OxPHP\Shared\Pool::stats()}. The volatile trio
+     * (`inUse()`/`idle()`/`waiting()`) is captured as one point-in-time
+     * sample: `idle` is read once and `inUse` is derived from it, so
+     * `size() === inUse() + idle()` holds for the object. The counters are
+     * not lock-coupled across the pool, so the snapshot is point-in-time,
+     * not atomic.
+     *
+     * Counters are exposed as accessor methods — the snapshot is immutable and
+     * holds no public state.
+     */
+    final class Stats
+    {
+        /** Slots currently checked out. */
+        public function inUse(): int {}
+
+        /** Free slots ready to hand out. */
+        public function idle(): int {}
+
+        /** Callers blocked in `acquire`. */
+        public function waiting(): int {}
+
+        /** Live slots: `inUse() + idle()`. */
+        public function size(): int {}
+
+        /** Configured hard budget. */
+        public function maxSize(): int {}
+
+        /** `inUse() / maxSize()`, or `0.0` when `maxSize()` is 0. */
+        public function utilization(): float {}
     }
 }
 
@@ -1832,6 +2496,9 @@ namespace OxPHP\Server {
          *         dispatched through serve().
          * false — traditional per-request lifecycle (php_request_startup /
          *         shutdown around each request).
+         *
+         * @see \oxphp_is_worker() Procedural equivalent; both return the same
+         *      value (delegate to the same underlying check).
          */
         public static function isWorkerMode(): bool {}
 
@@ -1841,7 +2508,7 @@ namespace OxPHP\Server {
          * Worker thread index, 0..N-1 where N is the configured pool size
          * (PHP_WORKERS). Stable for the lifetime of the thread.
          */
-        public function getId(): int {}
+        public function id(): int {}
 
         /**
          * Unix timestamp (float, sub-second precision) when this OS thread
@@ -1850,7 +2517,7 @@ namespace OxPHP\Server {
          *
          * For per-request start time, use OxPHP\Http\RequestInterface::startTime().
          */
-        public function getStartTime(): float {}
+        public function startTime(): float {}
 
         // ── Request counter ──
 
@@ -1865,7 +2532,7 @@ namespace OxPHP\Server {
          * traditional mode just as it survives across handler invocations
          * in worker mode.
          */
-        public function getRequestCount(): int {}
+        public function requestCount(): int {}
 
         // ── Memory observability ──
 
@@ -1875,7 +2542,7 @@ namespace OxPHP\Server {
          * Worker mode: cumulative across requests until the next gc cycle.
          * Traditional mode: scoped to the current request.
          */
-        public function getMemoryUsage(): int {}
+        public function memoryUsage(): int {}
 
         /**
          * Process RSS in bytes.
@@ -1886,9 +2553,9 @@ namespace OxPHP\Server {
          * variable.
          *
          * Use case: RSS-based recycle policy when extension-internal
-         * allocations are not visible to getMemoryUsage().
+         * allocations are not visible to memoryUsage().
          */
-        public function getRss(): int {}
+        public function rss(): int {}
 
         /**
          * Configured worker memory cap in bytes (WORKER_MAX_MEMORY_MIB × 1MB).
@@ -1898,7 +2565,36 @@ namespace OxPHP\Server {
          * traditional mode the value is reported for symmetry but not
          * enforced (PHP's per-request memory_limit applies instead).
          */
-        public function getMaxMemoryBytes(): int {}
+        public function maxMemoryBytes(): int {}
+
+        // ── Graceful exit ──
+
+        /**
+         * Mark this worker for graceful exit after the current request
+         * completes. The supervisor respawns a fresh worker, re-running
+         * the outer scope of the entry script.
+         *
+         * Idempotent: subsequent calls are no-ops; the first call wins
+         * and exitReason() reports 'scheduled'.
+         *
+         * No-op in traditional mode (the script is exiting anyway).
+         */
+        public function scheduleExit(): void {}
+
+        /**
+         * True iff scheduleExit() has been called for this worker, or
+         * the worker loop has otherwise queued an exit (e.g. memory cap
+         * exceeded). Always false in traditional mode.
+         */
+        public function isExitScheduled(): bool {}
+
+        /**
+         * Reason for the pending exit, or null when no exit is pending.
+         * One of: 'scheduled' (scheduleExit() was called), 'max_memory'
+         * (WORKER_MAX_MEMORY_MIB threshold crossed), 'error' (the worker
+         * loop bailed). Always null in traditional mode.
+         */
+        public function exitReason(): ?string {}
 
         // ── Worker entry point ──
 
@@ -1915,6 +2611,12 @@ namespace OxPHP\Server {
          * handed to the script.
          *
          * @throws \OxPHP\Server\Exception\InvalidServeContextException When called outside worker mode
+         *
+         * @see \oxphp_worker() Procedural equivalent. Both share the same
+         *      dispatch loop and per-thread re-entry guard, but differ at the
+         *      boundary: serve() throws InvalidServeContextException outside
+         *      worker mode, whereas oxphp_worker() emits E_WARNING and
+         *      returns false.
          */
         public function serve(callable $handler): void {}
     }
