@@ -13,7 +13,7 @@
  * per-request execution timer to N seconds from now.
  *
  * @package OxPHP
- * @version 0.6.0
+ * @version 0.7.0
  * @link https://github.com/oxphp/oxphp
  */
 
@@ -1008,6 +1008,13 @@ namespace OxPHP\Decorator {
      * via DecoratorAction::Reject.
      */
     class RejectedException extends \Exception {}
+
+    /**
+     * Thrown when nested decorated calls exceed the decorator context
+     * stack depth (256 levels). Fails loud instead of silently corrupting
+     * decorator context for the overflowing frame.
+     */
+    class StackOverflowException extends \Exception {}
 }
 
 // ═══════════════════════════════════════════════════════════════

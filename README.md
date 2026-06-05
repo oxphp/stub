@@ -181,7 +181,7 @@ The stub also declares the namespaced surface that the extension exposes at runt
 - `OxPHP\Http\{RequestInterface, SessionInterface, UploadedFileInterface, AttributesInterface}` and their final implementations (`Request`, `Session`, `UploadedFile`, `Attributes`).
 - `OxPHP\Http\Exception\{NoActiveRequestException, AsyncContextException, WorkerIdleException}` — thrown by `oxphp_http_request()` outside a live request context.
 - `OxPHP\Async\{AsyncException, TimeoutException, AggregateAsyncException, BorrowException, BorrowedProxy}` — thrown by the `oxphp_async_*()` family. `TimeoutException` exposes `getPartialErrors()` / `getCancelledPromiseIds()` (populated by `oxphp_async_await_any()`); `AggregateAsyncException` carries every rejection when all promises fail. `BorrowedProxy` is the opaque stand-in injected when a `use`-captured value is still borrowed by the source thread; every access throws `BorrowException`.
-- `OxPHP\Decorator\{AttributeInterface, Context, RejectedException}` — implement `AttributeInterface` and register with `oxphp_register_decorator()` to intercept calls.
+- `OxPHP\Decorator\{AttributeInterface, Context, RejectedException, StackOverflowException}` — implement `AttributeInterface` and register with `oxphp_register_decorator()` to intercept calls. `RejectedException` is thrown when a Rust-native decorator rejects the call; `StackOverflowException` when nested decorated calls exceed the decorator context stack depth (256 levels).
 - `OxPHP\Apm\Trace` — automatic span attribute (auto-registered when APM is enabled).
 - `OxPHP\Profile\*` — profiler functions and attributes (see above).
 - `OxPHP\Shared\*` — process-wide concurrent primitives (see above).
